@@ -1,0 +1,23 @@
+== Lunchbox ==
+
+Lunchbox is a real-time file push mechanism.  It allows one to transparently and
+securely manage a directory on a remote server.  This project is by no means an
+original idea (see Dropbox, inotifyfs, and sshfs for starters), but I do find it
+useful as a very lightweight and secure sync mechanism.
+
+== Usage ==
+
+Just run
+  bin/lunchbox sshspec:remotedir [localdir]
+
+For example,
+  bin/lunchbox gdb@example.com:/home/gdb/my-project my-project
+
+Would synchronize local changes to my-project to the remote my-project
+directory.
+
+== Note ==
+
+The current implementation was a proof-of-concept barebones implementation.  If
+I or someone else finds actual use-case for this system, I'd be happy to work on
+it more seriously.

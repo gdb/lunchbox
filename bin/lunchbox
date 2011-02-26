@@ -1,0 +1,133 @@
+#!/usr/bin/env python
+import atexit
+import logging
+import httplib
+import json
+import optparse
+import os
+import pyinotify
+import signal
+import subprocess
+import sys
+
+LOGGER_NAME = 'backend.%s'
+logging.basicConfig()
+logger = logging.getLogger(LOGGER_NAME % __name__)
+
+mask = pyinotify.IN_DELETE | pyinotify.IN_CREATE | pyinotify.IN_MODIFY | pyinotify.IN_MOVED_FROM | pyinotify.IN_MOVED_TO
+
+basedir = os.path.abspath(os.path.dirname(__file__))
+
+class Error(Exception):
+    pass
+
+def path(f):
+    return os.path.join(basedir, '../dirty-implementation-details', f)
+
+def popen(*args, **kwargs):
+    logger.debug('** call subprocess.Popen with %r and %r' % (args, kwargs))
+    return subprocess.Popen(*args, **kwargs)
+
+class FileMonitor(pyinotify.ProcessEvent):
+    def __init__(self, wm, host, dir, localport=9020, remoteport=9020):
+        self.wm = wm
+        self.host = host
+        self.dir = dir
+        self.localport = localport
+        self.remoteport = remoteport
+        self.connection = None
+
+    def connect(self):
+        p = popen(['ssh', self.host, 'cat > /tmp/lunchbox-server'], stdin=subprocess.PIPE)
+        p.communicate(open(path('lunchbox-server')).read())
+        if p.returncode != 0:
+            raise Error('Could not send lunchbox-server to server')
+
+        fwdspec = '-L%d:localhost:%d' % (self.localport, self.remoteport)
+        self.srvproc = popen(['ssh', fwdspec, self.host, 'python /tmp/lunchbox-server -vv'], stdin=subprocess.PIPE)
+
+    def disconnect(self):
+        # TODO: not actually what you want
+        self.srvproc.communicate()
+
+    def sendmsg(self, msg):
+        logger.info("Sending message %r" % msg)
+        conn = httplib.HTTPConnection('localhost', 9020)
+        conn.request('POST', '/', json.dumps(msg))
+        resp = conn.getresponse()
+        resp = resp.read()
+        logger.info('Server response: %r' % resp)
+        return resp
+
+    def _event2msg(self, action, event):
+        logger.info("Event: %r" % event)
+        msg = {
+            'action' : action,
+            'path' : os.path.join(self.dir, event.path, event.name)
+            }
+        if event.mask & pyinotify.IN_ISDIR:
+            msg['type'] = 'directory'
+        return msg
+
+    def process_IN_CREATE(self, event):
+        msg = self._event2msg('create', event)
+        self.wm.add_watch(event.path, mask, rec=True)
+        self.sendmsg(msg)
+
+    def process_IN_DELETE(self, event):
+        msg = self._event2msg('delete', event)
+        self.sendmsg(msg)
+
+    def process_IN_MODIFY(self, event):
+        msg = self._event2msg('modify', event)
+        msg['contents'] = open(os.path.join(event.path, event.name)).read()
+        self.sendmsg(msg)
+
+    def process_IN_MOVED_FROM(self, event):
+        msg = self._event2msg('moved_from', event)
+        self.sendmsg(msg)
+
+    def process_IN_MOVED_TO(self, event):
+        msg = self._event2msg('moved_to', event)
+        self.sendmsg(msg)
+
+def main():
+    parser = optparse.OptionParser("""%prog [options] hostspec:dir [local]""")
+    parser.add_option('-v', '--verbosity', help='Verbosity of debugging output.',
+                      dest='verbosity', action='count', default=0)
+    opts, args = parser.parse_args()
+    if opts.verbosity == 1:
+        logger.setLevel(logging.INFO)
+    elif opts.verbosity >= 2:
+        logger.setLevel(logging.DEBUG)
+
+    if len(args) != 1 and len(args) != 2:
+        parser.print_help()
+        return 1
+    host, dir = args[0].split(':')
+
+    if len(args) == 2:
+        local = args[1]
+    else:
+        local = '.'
+
+    os.chdir(local)
+
+    wm = pyinotify.WatchManager()
+    mon = FileMonitor(wm, host, dir)
+    mon.connect()
+    notifier = pyinotify.Notifier(wm, mon)
+    wdd = wm.add_watch('.', mask, rec=True)
+    while True:  # loop forever
+        try:
+            notifier.process_events()
+            if notifier.check_events():
+                notifier.read_events()
+        except KeyboardInterrupt:
+            notifier.stop()
+            break
+    mon.disconnect()
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

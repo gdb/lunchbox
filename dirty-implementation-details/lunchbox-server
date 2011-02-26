@@ -1,0 +1,108 @@
+#!/usr/bin/env python
+import logging
+import json
+import optparse
+import os
+import signal
+import socket
+import sys
+import threading
+import time
+import SocketServer
+
+LOGGER_NAME = 'backend.%s'
+logging.basicConfig()
+logger = logging.getLogger(LOGGER_NAME % __name__)
+
+import string,cgi,time
+from os import curdir, sep
+from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
+
+done = False
+
+class SyncfsServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type','text/plain')
+        self.end_headers()
+        self.wfile.write("Success!  Now try POSTing some data.\n")
+
+    def do_POST(self):
+        global rootnode
+        self.send_response(200)
+        self.send_header('Content-type','text/plain')
+        self.end_headers()
+        length = int(self.headers.getheader('content-length'))
+        msg = self.rfile.read(length)
+        msg = json.loads(msg)
+        try:
+            resp = self.handle_msg(msg)
+        except Exception, e:
+            resp = 'Exception: %s' % e
+        self.wfile.write(resp or 'Success')
+
+    def abspath(self, file):
+        return os.path.join(file)
+
+    def handle_msg(self, msg):
+        path = self.abspath(msg['path'])
+        action = msg['action']
+        if action == 'create':
+            if msg.get('type') == 'directory':
+                os.mkdir(path)
+            else:
+                open(path, 'a').close()
+        elif action == 'delete':
+            if msg.get('type') == 'directory':
+                os.rmdir(path)
+            else:
+                os.unlink(path)
+        elif action == 'modify':
+            f = open(path, 'w')
+            f.write(msg['contents'])
+        else:
+            raise NotImplementedError("Sorry, didn't get around to building that just yet.")
+
+def main():
+    global done
+    parser = optparse.OptionParser("""%prog [options] [port]""")
+    parser.add_option('-v', '--verbosity', help='Verbosity of debugging output.',
+                      dest='verbosity', action='count', default=0)
+    opts, args = parser.parse_args()
+    if opts.verbosity == 1:
+        logger.setLevel(logging.INFO)
+    elif opts.verbosity >= 2:
+        logger.setLevel(logging.DEBUG)
+    if len(args) == 0:
+        port = 9020
+    elif len(args) == 1:
+        port = int(args[0])
+    else:
+        parser.print_help()
+        return 1
+
+    # Hack to get rid of existing instances
+    try:
+        pid = int(open('/tmp/syncfs-server.pid').read())
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.5)
+    except Exception, e:
+        print 'Error: %s' % e
+
+    f = open('/tmp/syncfs-server.pid', 'w')
+    f.write(str(os.getpid()))
+    f.close()
+
+    try:
+        server = HTTPServer(('127.0.0.1', port), SyncfsServer)
+        print 'started httpserver...'
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print '^C received, shutting down server'
+        server.socket.close()
+        print 'yeah'
+    done = True
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
