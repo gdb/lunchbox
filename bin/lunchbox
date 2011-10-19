@@ -9,6 +9,7 @@ import pyinotify
 import signal
 import subprocess
 import sys
+from time import sleep
 
 LOGGER_NAME = 'backend.%s'
 logging.basicConfig()
@@ -91,10 +92,95 @@ class FileMonitor(pyinotify.ProcessEvent):
         msg = self._event2msg('moved_to', event)
         self.sendmsg(msg)
 
+class EC2Initializer():
+    def __init__(self, host, ami):
+        hostspec = host.split('@')
+        if len(hostspec) == 2:
+            self.user = hostspec[0]
+            self.host = hostspec[1]
+        elif len(hostspec) == 1:
+            self.host = hostspec[0]
+        else:
+            raise Error('Can\'t parse what I expect to be a hostspec %s' % host)
+        self.ami = ami
+
+    def parse_instance_from_run_response(self, response):
+        # replies are tab-separated lines; reservation is the first
+        # line, instance is the second:
+        return response.split("\n")[1].split("\t")[1]
+
+    def parse_instance_status_from_describe_response(self, response):
+        instance_line = response.split("\n")[1]
+        instance_status = instance_line.split("\t")
+        assert(instance_status[0] == 'INSTANCE')
+        assert(instance_status[1] == self.instance_id)
+        host = None
+        if instance_status[3] != '(nil)':
+            host = instance_status[3]
+        return (instance_status[5], host)
+    
+    def split_into_args(self, argstring):
+        # XXX: This might want to do some smart shell-y thing. Right
+        # now it's like $*; ugh.
+        split_args = argstring.split(' ')
+        if split_args == ['']:
+            # No idea why splitting an empty string results in [''],
+            # but let's work around this for now:
+            return []
+        else:
+            return split_args
+        
+        
+    def run(self, general_options, specific_options):
+        general_options = self.split_into_args(general_options)
+        specific_options = self.split_into_args(specific_options)
+        args = ['ec2-run-instances'] + general_options + [self.ami, '-f', path('ec2-launch-codes')] + specific_options
+        p = popen(args,
+                  stdout=subprocess.PIPE)
+        stdout, stderr = p.communicate()
+        assert(p.returncode == 0)
+        self.instance_id = self.parse_instance_from_run_response(stdout)
+
+    def can_connect(self, host):
+        logger.debug('Trying to connect to %s:22' % host)
+        p = popen(['ssh', host, 'exit', '0'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = p.communicate()
+        logger.debug('ssh attempt yielded %s and %s' % (stdout, stderr))
+        return p.returncode == 0
+        
+        
+    def wait_until_launched(self):
+        started = False
+        while not started:
+            p = popen(['ec2-describe-instances', '--show-empty-fields', self.instance_id],
+                      stdout=subprocess.PIPE)
+            stdout, stderr = p.communicate()
+            assert(p.returncode == 0)
+            logger.debug('Getting instance status:\n%s--' % stdout)
+            status, host = self.parse_instance_status_from_describe_response(stdout)
+            started = (status == 'running' and host != None)
+            if not started:
+                sleep(1)
+        if self.user:
+            host = '%s@%s' % (self.user, host)
+        while not self.can_connect(host):
+            sleep(1)
+        logger.warning('Started instance %s at host %s' % (self.instance_id, host))
+        return host
+        
+    
+    
+        
 def main():
     parser = optparse.OptionParser("""%prog [options] hostspec:dir [local]""")
     parser.add_option('-v', '--verbosity', help='Verbosity of debugging output.',
                       dest='verbosity', action='count', default=0)
+    parser.add_option('-a', '--ec2-ami', help='EC2 instance with this AMI',
+                      dest='instance_ami', action='store_const', default='ami-a7f539ce')
+    parser.add_option('-g', '--ec2-general-args', help='Additional general args to pass to ec2-run-instances',
+                      dest='instance_general_args', action='store', type='string', default='')
+    parser.add_option('-s', '--ec2-specific-args', help='Additional specific args to pass to ec2-run-instances',
+                      dest='instance_specific_args', action='store', type='string', default='')
     opts, args = parser.parse_args()
     if opts.verbosity == 1:
         logger.setLevel(logging.INFO)
@@ -111,6 +197,11 @@ def main():
     else:
         local = '.'
 
+    if host[0] == '%':
+        initializer = EC2Initializer(host[1:], opts.instance_ami)
+        initializer.run(opts.instance_general_args, opts.instance_specific_args)
+        host = initializer.wait_until_launched()
+        
     os.chdir(local)
 
     wm = pyinotify.WatchManager()
